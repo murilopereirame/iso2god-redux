@@ -1,15 +1,15 @@
 use iso2god::executable::TitleInfo;
 use iso2god::god::{ContentType, HashList};
 use iso2god::{game_list, god, iso};
+use log::info;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::fs;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use log::info;
-use serde_repr::{Deserialize_repr, Serialize_repr};
 use tauri::{Emitter, Error};
 
 #[derive(Serialize_repr, Deserialize_repr, Clone, Debug, PartialEq)]
@@ -17,7 +17,7 @@ use tauri::{Emitter, Error};
 pub enum Padding {
     Untouched,
     Partial,
-    RemoveAll
+    RemoveAll,
 }
 
 #[derive(Serialize_repr, Deserialize_repr, Clone, Debug)]
@@ -25,7 +25,7 @@ pub enum Padding {
 pub enum Format {
     God,
     GodAndIso,
-    Iso
+    Iso,
 }
 
 #[derive(Serialize_repr, Deserialize_repr, Clone, Debug)]
@@ -41,7 +41,7 @@ pub enum GODLayout {
 #[repr(u16)]
 pub enum Platform {
     Xbox360,
-    Xbox
+    Xbox,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,7 +64,7 @@ struct OutputOptions {
     format: Format,
     auto_rename: bool,
     god_layout: GODLayout,
-    padding: Padding
+    padding: Padding,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,8 +103,17 @@ struct Progress {
 static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 
 fn report_progress(app: &tauri::AppHandle, source: &str, progress: f64) {
-    if CANCEL_FLAG.load(Ordering::Relaxed) { return; }
-    app.emit("progress-report", Progress { source: source.to_string(), progress }).unwrap();
+    if CANCEL_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
+    app.emit(
+        "progress-report",
+        Progress {
+            source: source.to_string(),
+            progress,
+        },
+    )
+    .unwrap();
 }
 
 #[tauri::command]
@@ -116,12 +125,11 @@ fn cancel() {
 fn convert_iso(app: &tauri::AppHandle, iso: Iso) {
     let mut progress = 5.0;
     let source_iso_file = File::open(&iso.source).expect("Failed to open the ISO file");
-    
+
     let source_iso_file_meta =
         fs::metadata(&iso.source).expect("Error reading source ISO file metadata");
 
-    let mut source_iso =
-        iso::IsoReader::read(source_iso_file).expect("Error reading source ISO");
+    let mut source_iso = iso::IsoReader::read(source_iso_file).expect("Error reading source ISO");
 
     report_progress(app, &iso.source, progress);
 
@@ -137,7 +145,7 @@ fn convert_iso(app: &tauri::AppHandle, iso: Iso) {
         let root_offset = source_iso.volume_descriptor.root_offset;
         source_iso_file_meta.len() - root_offset
     };
-        
+
     let block_count = data_size.div_ceil(god::BLOCK_SIZE);
     let part_count = block_count.div_ceil(god::BLOCKS_PER_PART);
 
@@ -155,7 +163,6 @@ fn convert_iso(app: &tauri::AppHandle, iso: Iso) {
 
     progress += 5.0;
     report_progress(app, &iso.source, 20.0);
-    
 
     let part_progress = AtomicUsize::new(0);
     let progress_per_part = 30.0 / part_count as f64;
@@ -164,42 +171,44 @@ fn convert_iso(app: &tauri::AppHandle, iso: Iso) {
         return;
     }
 
-    (0..part_count).into_iter().try_for_each(|part_index| {
-        if CANCEL_FLAG.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        
-        info!("Writing Part {} of {}", part_index + 1, part_count);
-        let mut iso_data_volume = File::open(&iso.source)?;
-        iso_data_volume.seek(SeekFrom::Start(source_iso.volume_descriptor.root_offset))?;
+    (0..part_count)
+        .into_iter()
+        .try_for_each(|part_index| {
+            if CANCEL_FLAG.load(Ordering::Relaxed) {
+                return Ok(());
+            }
 
-        let part_file = file_layout.part_file_path(part_index);
+            info!("Writing Part {} of {}", part_index + 1, part_count);
+            let mut iso_data_volume = File::open(&iso.source)?;
+            iso_data_volume.seek(SeekFrom::Start(source_iso.volume_descriptor.root_offset))?;
 
-        let part_file = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&part_file)
-            .expect("Error creating part file");
+            let part_file = file_layout.part_file_path(part_index);
 
-        god::write_part(iso_data_volume, part_index, part_file)
-            .expect("Error writing part file");
+            let part_file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&part_file)
+                .expect("Error creating part file");
 
-        part_progress.fetch_add(1, Ordering::Relaxed);
+            god::write_part(iso_data_volume, part_index, part_file)
+                .expect("Error writing part file");
 
-        progress += progress_per_part;
-        report_progress(app, &iso.source, progress);
-        
-        Ok::<_, Error>(())
-    }).expect("Error during partitioning");
+            part_progress.fetch_add(1, Ordering::Relaxed);
+
+            progress += progress_per_part;
+            report_progress(app, &iso.source, progress);
+
+            Ok::<_, Error>(())
+        })
+        .expect("Error during partitioning");
 
     if CANCEL_FLAG.load(Ordering::Relaxed) {
         return;
     }
 
     progress += 10.0;
-    let mut mht =
-        read_part_mht(&file_layout, part_count - 1).expect("error reading part file MHT");
+    let mut mht = read_part_mht(&file_layout, part_count - 1).expect("error reading part file MHT");
 
     report_progress(app, &iso.source, progress);
     if CANCEL_FLAG.load(Ordering::Relaxed) {
@@ -221,7 +230,7 @@ fn convert_iso(app: &tauri::AppHandle, iso: Iso) {
             .expect("error writing part file MHT");
 
         mht = prev_mht;
-        
+
         progress += progress_per_part;
         report_progress(app, &iso.source, progress);
     }
@@ -270,11 +279,14 @@ fn convert_iso(app: &tauri::AppHandle, iso: Iso) {
 
     progress += 10.0;
     report_progress(app, &iso.source, progress);
-    
+
     info!("done");
 }
 
-fn read_part_mht(file_layout: &god::FileLayout, part_index: u64) -> Result<HashList, anyhow::Error> {
+fn read_part_mht(
+    file_layout: &god::FileLayout,
+    part_index: u64,
+) -> Result<HashList, anyhow::Error> {
     let part_file = file_layout.part_file_path(part_index);
     let test = &part_file.as_path().as_os_str().to_str().unwrap();
     info!("reading part file: {part_index} {test}");
@@ -308,13 +320,10 @@ async fn convert(app_handle: tauri::AppHandle, isos: Vec<Iso>) -> Result<(), Err
 
     for iso in isos {
         let app_handle = app_handle.clone();
-        threads.push(thread::spawn(move || {
-           convert_iso(&app_handle, iso)
-        }))
+        threads.push(thread::spawn(move || convert_iso(&app_handle, iso)))
     }
 
-
-    let _: Vec<_>  = threads.into_iter().map(|h| h.join().unwrap()).collect();
+    let _: Vec<_> = threads.into_iter().map(|h| h.join().unwrap()).collect();
 
     if CANCEL_FLAG.load(Ordering::Relaxed) {
         return Err(Error::Io(std::io::Error::new(
@@ -335,8 +344,7 @@ fn read_iso(path: &str) -> IsoGame {
 
     let title_id = format!("{:08X}", exe_info.title_id);
     let media_id = format!("{:08X}", exe_info.media_id);
-    let name =
-        game_list::find_title_by_id(exe_info.title_id).expect("Failed to find the title by id");
+    let name = game_list::find_title_by_id(exe_info.title_id).unwrap_or("Unknown".to_string());
     let content_type = match title_info.content_type {
         ContentType::GamesOnDemand => "Games on Demand",
         ContentType::XboxOriginal => "Xbox Original",
@@ -360,26 +368,24 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_log::Builder::new()
-            .targets([
-                tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Webview,
-                ),
-                tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Stdout,
-                ),
-            ])
-            .format(|out, message, record| {
-                out.finish(format_args!(
-                    "[{} {}] {}",
-                    record.level(),
-                    record.target(),
-                    message
-                ))
-            })
-            .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
-            .level(log::LevelFilter::Info)
-            .build())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                ])
+                .format(|out, message, record| {
+                    out.finish(format_args!(
+                        "[{} {}] {}",
+                        record.level(),
+                        record.target(),
+                        message
+                    ))
+                })
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![convert, read_iso, cancel])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
